@@ -10,6 +10,7 @@ virtualenv venv
 
 # activate the virtual environment on windows
 venv/Scripts/activate
+
 # activate the virtual environment on linux
 source venv/bin/activate
 ```
@@ -32,7 +33,7 @@ python inference_gui.py
 
 ### Outputs
 The GUI writes:
-- Summary JSON to: `<output-dir>/detections_<timestamp>.json`
+- Summary JSON to: `runs/inference_gui/detections_<timestamp>.json`
 - Annotated images are saved upon user's request
 
 Detection JSON shape per tag:
@@ -99,4 +100,6 @@ Detection JSON shape per tag:
 
 ## Acknowledgements
 1. [Ultralytics](https://ultralytics.com/)
-2. [EasyOCR](https://github.com/jaidedai/easyocr)
+2. [OpenCV](https://github.com/opencv/opencv-python)
+3. [PyTorch](https://pytorch.org/)
+4. [EasyOCR](https://github.com/jaidedai/easyocr)
