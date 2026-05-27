@@ -50,6 +50,10 @@ Detection JSON shape per tag:
 }
 ```
 
+### Demo
+
+https://github.com/user-attachments/assets/e254a315-e6b0-48c3-a855-17d6bb277b38
+
 ## Run In Terminal
 
 Basic usage:
