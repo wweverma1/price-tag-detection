@@ -4,8 +4,7 @@ import json
 import queue
 import sys
 import threading
-import time
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -15,6 +14,7 @@ import numpy as np
 import tkinter as tk
 from PIL import Image, ImageTk
 from tkinter import filedialog, messagebox, ttk
+from ocr import PriceOCRService, read_image_bgr
 from ultralytics import YOLO
 
 WEIGHTS_PATH = Path("./weights/best.pt")
@@ -47,6 +47,7 @@ ERROR_IMAGE_LOAD_MESSAGE = "Current image could not be loaded."
 INFO_IMAGE_SAVED_TITLE = "Image Saved"
 INFO_INFERENCE_RUNNING_TITLE = "Inference running"
 ERROR_INFERENCE_TITLE = "Inference Error"
+WARNING_INFERENCE_TITLE = "Inference Warning"
 CLEAR_PROGRESS_TEXT = "Cleared. Click preview to select image(s)."
 MODEL_LOADING_PROGRESS_TEXT = "Loading YOLO model..."
 MODEL_READY_WAITING_TEXT = "Model ready. Waiting for image(s)..."
@@ -59,9 +60,12 @@ INFERENCE_RUNNING_MESSAGE = (
 )
 MODEL_LOAD_ERROR_TEMPLATE = "Failed to load model: {error}"
 INFERENCE_ERROR_TEMPLATE = "Inference failed for {name}: {error}"
+OCR_ERROR_TEMPLATE = "OCR failed for {name}, price tag {tag_id}: {error}"
 INFERENCE_DONE_TEMPLATE = "Inference complete. Saved summary: {summary_path}"
 INFERENCE_DETECTING_TEMPLATE = "Detecting image {index}/{total}: {name}"
-INFERENCE_OCR_PLACEHOLDER_TEMPLATE = "OCR stage placeholder for image {index}/{total}"
+INFERENCE_OCR_TEMPLATE = (
+    "Reading OCR for image {index}/{total}, price tag {tag_id}/{tag_count}"
+)
 SAVE_FILENAME_TEMPLATE = "detections_{timestamp}.jpg"
 SUMMARY_FILENAME_TEMPLATE = "detections_{timestamp}.json"
 TIMESTAMP_FORMAT = "%Y%m%d_%H%M%S"
@@ -81,7 +85,6 @@ BOX_COLOR_BGR = (204, 102, 255)
 BOX_LABEL_TEXT_COLOR_BGR = (255, 255, 255)
 LABEL_FONT_SCALE = 0.72
 LABEL_FONT_THICKNESS = 2
-OCR_PLACEHOLDER_DELAY_S = 0.05
 PREVIEW_MIN_DIMENSION = 100
 PREVIEW_CANVAS_BG_VALUE = 248
 ROOT_BG_COLOR = "#edf1f7"
@@ -123,6 +126,7 @@ ACTION_ORDER = [
     ACTION_RUNNING_OCR,
     ACTION_IDLE,
 ]
+type OCRNumber = int | float
 
 
 @dataclass
@@ -130,14 +134,21 @@ class PriceTagDetection:
     tag_id: int
     confidence: float
     bbox: list[int]
-    ocr_value: str | None = None
+    ocr_value: OCRNumber | None = None
+    ocr_confidence: float | None = None
 
 
 class InferenceGUI:
-    def __init__(self, root: tk.Tk, weights_path: Path):
+    def __init__(
+        self,
+        root: tk.Tk,
+        weights_path: Path,
+        ocr_service: PriceOCRService | None = None,
+    ):
         self.root = root
         self.weights_path = weights_path
         self.output_dir = self._resolve_output_dir()
+        self.ocr_service = ocr_service or PriceOCRService()
         self.model: YOLO | None = None
         self.model_loaded = False
         self.inference_started = False
@@ -597,7 +608,7 @@ class InferenceGUI:
             except Exception as exc:  # noqa: BLE001
                 self.event_queue.put(
                     (
-                        "error",
+                        "warning",
                         INFERENCE_ERROR_TEMPLATE.format(
                             name=image_path.name, error=exc
                         ),
@@ -615,27 +626,76 @@ class InferenceGUI:
                         confidence=confidence,
                         bbox=coords,
                         ocr_value=None,
+                        ocr_confidence=None,
                     )
                 )
 
-            detections_payload[str(image_path)] = [asdict(d) for d in detections]
             self.event_queue.put(
                 ("result", {"path": image_path, "detections": detections})
             )
 
-            self.event_queue.put(
-                (
-                    "action",
-                    {
-                        "action": ACTION_RUNNING_OCR,
-                        "text": INFERENCE_OCR_PLACEHOLDER_TEMPLATE.format(
-                            index=idx, total=total
-                        ),
-                        "progress": (idx / total) * 100,
-                    },
+            raw_image = read_image_bgr(image_path)
+            tag_count = len(detections)
+            for tag_position, detection in enumerate(detections, start=1):
+                if self.stop_event.is_set():
+                    return
+
+                self.event_queue.put(
+                    (
+                        "action",
+                        {
+                            "action": ACTION_RUNNING_OCR,
+                            "text": INFERENCE_OCR_TEMPLATE.format(
+                                index=idx,
+                                total=total,
+                                tag_id=detection.tag_id,
+                                tag_count=tag_count,
+                            ),
+                            "progress": (
+                                ((idx - 1) + (tag_position / max(1, tag_count))) / total
+                            )
+                            * 100,
+                        },
+                    )
                 )
-            )
-            time.sleep(OCR_PLACEHOLDER_DELAY_S)
+
+                ocr_value: OCRNumber | None = None
+                ocr_confidence: float | None = None
+                if raw_image is not None:
+                    try:
+                        ocr_value, ocr_confidence = self.ocr_service.resolve_price(
+                            raw_image, detection.bbox
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        self.event_queue.put(
+                            (
+                                "error",
+                                OCR_ERROR_TEMPLATE.format(
+                                    name=image_path.name,
+                                    tag_id=detection.tag_id,
+                                    error=exc,
+                                ),
+                            )
+                        )
+                        return
+
+                detection.ocr_value = ocr_value
+                detection.ocr_confidence = ocr_confidence
+                self.event_queue.put(
+                    (
+                        "ocr_result",
+                        {
+                            "path": image_path,
+                            "tag_id": detection.tag_id,
+                            "ocr_value": ocr_value,
+                            "ocr_confidence": ocr_confidence,
+                        },
+                    )
+                )
+
+            detections_payload[str(image_path)] = [
+                self._serialize_detection(d) for d in detections
+            ]
 
         summary_path = self._write_summary(detections_payload, conf_threshold)
         self.event_queue.put(("done", summary_path))
@@ -691,6 +751,13 @@ class InferenceGUI:
                 if self._current_image_path() == path:
                     self._refresh_tag_list_for_current_image()
                     self._render_current_preview()
+            elif event == "ocr_result":
+                self._apply_ocr_result(
+                    payload["path"],
+                    payload["tag_id"],
+                    payload["ocr_value"],
+                    payload["ocr_confidence"],
+                )
             elif event == "done":
                 self.summary_path = payload
                 self.is_inferencing = False
@@ -707,6 +774,8 @@ class InferenceGUI:
                 self._update_navigation_controls()
                 self._refresh_tag_list_for_current_image()
                 self._render_current_preview()
+            elif event == "warning":
+                messagebox.showwarning(WARNING_INFERENCE_TITLE, str(payload))
             elif event == "error":
                 self.is_inferencing = False
                 self._set_action(
@@ -730,8 +799,7 @@ class InferenceGUI:
         if image_path in self.preview_cache:
             return self.preview_cache[image_path]
 
-        buffer = np.fromfile(str(image_path), dtype=np.uint8)
-        image = cv2.imdecode(buffer, cv2.IMREAD_COLOR)
+        image = read_image_bgr(image_path)
         if image is None:
             return None
         self.preview_cache[image_path] = image
@@ -743,10 +811,50 @@ class InferenceGUI:
             return detections
         return [d for d in detections if d.tag_id == self.selected_tag_id]
 
+    def _apply_ocr_result(
+        self,
+        image_path: Path,
+        tag_id: int,
+        ocr_value: OCRNumber | None,
+        ocr_confidence: float | None,
+    ) -> None:
+        for detection in self.detections_by_image.get(image_path, []):
+            if detection.tag_id == tag_id:
+                detection.ocr_value = ocr_value
+                detection.ocr_confidence = ocr_confidence
+                break
+
+        if self._current_image_path() == image_path:
+            self._refresh_tag_list_for_current_image()
+            self._render_current_preview()
+
+    @staticmethod
+    def _format_ocr_value(value: OCRNumber) -> str:
+        if isinstance(value, float):
+            return f"{value:g}"
+        return str(value)
+
+    @staticmethod
+    def _serialize_detection(det: PriceTagDetection) -> dict[str, Any]:
+        return {
+            "tag_id": det.tag_id,
+            "confidence": det.confidence,
+            "bbox": det.bbox,
+            "ocr": {
+                "value": det.ocr_value,
+                "confidence": det.ocr_confidence,
+            },
+        }
+
     def _format_detection_text(self, det: PriceTagDetection) -> str:
-        if det.ocr_value is None or det.ocr_value == "":
+        if det.ocr_value is None:
             return f"Conf: {det.confidence:.2f}"
-        return f"Conf: {det.confidence:.2f} | OCR: {det.ocr_value}"
+        ocr_text = self._format_ocr_value(det.ocr_value)
+        if det.ocr_confidence is None:
+            return f"Conf: {det.confidence:.2f} | OCR: {ocr_text}"
+        return (
+            f"Conf: {det.confidence:.2f} | OCR: {ocr_text} ({det.ocr_confidence:.2f})"
+        )
 
     def _compose_annotated_image(self, image_path: Path) -> np.ndarray | None:
         image = self._read_image(image_path)
